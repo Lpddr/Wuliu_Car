@@ -1,0 +1,22 @@
+
+import os
+from building import *
+
+cwd = GetCurrentDir()
+src  = Glob('*.c')
+# add cubemx drivers
+src = Split('''
+Src/stm32f4xx_hal_msp.c
+Src/stm32f4xx_it.c
+Src/usart.c
+Src/tim.c
+Src/gpio.c
+Src/dma.c
+''')
+
+path = [cwd]
+path += [cwd + '/Inc']
+
+group = DefineGroup('cubemx', src, depend = [''], CPPPATH = path)
+
+Return('group')
