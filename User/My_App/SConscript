@@ -1,0 +1,9 @@
+from building import *
+
+cwd = GetCurrentDir()
+src = Glob('*.c')
+CPPPATH = [cwd, os.path.join(cwd, '..', 'My_Driver'), os.path.join(cwd, '..', 'Components')]
+
+group = DefineGroup('My_App', src, depend = [''], CPPPATH = CPPPATH)
+
+Return('group')
