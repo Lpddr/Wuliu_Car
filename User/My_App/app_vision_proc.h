@@ -23,7 +23,7 @@ typedef struct
     rt_tick_t last_update; /* 最后更新系统时间 */
 } App_Vision_Data_t;
 
-extern App_Vision_Data_t vision_app_data;
+extern volatile App_Vision_Data_t vision_app_data;
 extern rt_mq_t vision_mq; /* 消息队列：对接 MaixCam 的异步解析中枢 */
 
 /**
