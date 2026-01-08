@@ -29,6 +29,23 @@ static uint8_t g_batch2[3] = {0};
 /* 2. 当前状态全局追踪 */
 static Mission_State_t current_state = STATE_IDLE;
 
+/* [Safety] 视觉看门狗: 防止摄像头卡死导致 PID 暴走 */
+static void Check_Vision_Timeout(void)
+{
+    /* 如果超过 360ms 没有新数据 (正常是一帧) */
+    if ((rt_tick_get() - vision_app_data.last_update) > rt_tick_from_millisecond(360))
+    {
+        /* 只有当正在寻像时才打印警告，避免刷屏 */
+        if (vision_app_data.is_found == RT_TRUE)
+        {
+            LOG_E("[Safety] Vision Data Timeout! Stopping car...");
+        }
+
+        Move_Stop();                         // 1. 立即停车
+        vision_app_data.is_found = RT_FALSE; // 2. 强制置为未找到 (中断 PID 循环)
+    }
+}
+
 /**
  * @brief 大脑指揮中心线程入口
  */
@@ -108,6 +125,9 @@ static void brain_thread_entry(void *parameter)
 
                 while (1)
                 {
+                    /* [Safety] 检查视觉心跳 */
+                    Check_Vision_Timeout();
+
                     /* 只有当看到的 ID 匹配，且视野中确实有物料时才判定成功 */
                     if (vision_app_data.is_found && vision_app_data.target_id == target_id)
                     {
@@ -175,6 +195,9 @@ static void brain_thread_entry(void *parameter)
                 /* 3. 视觉纠偏  */
                 while (1)
                 {
+                    /* [Safety] 检查视觉心跳 */
+                    Check_Vision_Timeout();
+
                     uint8_t ring_id = g_batch1[i] + 3;
 
                     // 仅当找到目标且 ID 匹配时才获取坐标
@@ -287,6 +310,9 @@ static void brain_thread_entry(void *parameter)
                 /* 3. 视觉纠偏 (适配 90° 旋转后的 XY 映射) */
                 while (1)
                 {
+                    /* [Safety] 检查视觉心跳 */
+                    Check_Vision_Timeout();
+
                     uint8_t ring_id = g_batch1[i] + 3;
                     if (!vision_app_data.is_found || vision_app_data.target_id != ring_id)
                     {
@@ -352,6 +378,9 @@ static void brain_thread_entry(void *parameter)
 
                 while (1)
                 {
+                    /* [Safety] 检查视觉心跳 */
+                    Check_Vision_Timeout();
+
                     if (vision_app_data.is_found && vision_app_data.target_id == target_id)
                     {
                         break;
@@ -417,6 +446,9 @@ static void brain_thread_entry(void *parameter)
                 /* 3. 视觉纠偏 (适配 90° 旋转后的 XY 映射) */
                 while (1)
                 {
+                    /* [Safety] 检查视觉心跳 */
+                    Check_Vision_Timeout();
+
                     uint8_t ring_id = g_batch2[i] + 3;
                     if (!vision_app_data.is_found || vision_app_data.target_id != ring_id)
                     {
@@ -524,6 +556,9 @@ static void brain_thread_entry(void *parameter)
                 /* 3. 视觉纠偏 (瞄准第一层已放好的货/色环) */
                 while (1)
                 {
+                    /* [Safety] 检查视觉心跳 */
+                    Check_Vision_Timeout();
+
                     // 瞄准点依然是当初放置第一批次时的色环 ID
                     uint8_t ring_id = g_batch1[i] + 3;
 

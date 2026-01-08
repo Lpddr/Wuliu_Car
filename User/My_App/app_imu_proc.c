@@ -16,7 +16,7 @@
 #define IMU_PRIORITY 10
 #define IMU_TICK 5
 
-    App_IMU_Data_t imu_app_data = {0}; /* 全局共享姿态数据 */
+App_IMU_Data_t imu_app_data = {0}; /* 全局共享姿态数据 */
 rt_mq_t imu_mq = RT_NULL;              /* imu 队列 */
 rt_mutex_t imu_data_mutex = RT_NULL;   /* imu 互斥锁 */
 

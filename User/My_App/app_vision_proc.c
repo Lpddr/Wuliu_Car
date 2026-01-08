@@ -14,7 +14,7 @@
 #define VISION_PRIORITY 11
 #define VISION_TICK 5
 
-App_Vision_Data_t vision_app_data = {0};
+volatile App_Vision_Data_t vision_app_data = {0};
 rt_mq_t vision_mq = RT_NULL;
 
 static rt_thread_t vision_thread = RT_NULL;
