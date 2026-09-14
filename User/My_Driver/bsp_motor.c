@@ -7,10 +7,17 @@
  */
 
 #include "bsp_motor.h"
+#include <rtthread.h>
 
 extern TIM_HandleTypeDef htim1;
+#if MOTOR_LIFT_ENABLED
 extern TIM_HandleTypeDef htim2;
+#endif
 #include "../../cubemx/Inc/main.h"
+
+#define DBG_TAG "bsp.motor"
+#define DBG_LVL DBG_INFO
+#include <rtdbg.h>
 
 /* 电机实例 */
 Motor_t motor_1;
@@ -21,8 +28,10 @@ Motor_t motor_5;
 
 /**
  * @brief  初始化电机硬件
+ * @note   返回 int 是为了匹配 RT-Thread 的 init_fn_t 原型，可以直接被
+ *         INIT_xxx_EXPORT 导出（BSP_Servo_Init 也是这个约定）。
  */
-void BSP_Motor_Init(void)
+int BSP_Motor_Init(void)
 {
     /* 电机 1: TIM1_CH1, PD0(DIR), PD1(EN) */
     motor_1.config.htim = &htim1;
@@ -60,8 +69,14 @@ void BSP_Motor_Init(void)
     motor_4.config.en.pin = GPIO_PIN_10;
     motor_4.config.reverse = 0;
 
+    /* 启动 TIM1 的四个通道 (使用中断模式以统计步数) */
+    HAL_TIM_OC_Start_IT(motor_1.config.htim, motor_1.config.channel);
+    HAL_TIM_OC_Start_IT(motor_2.config.htim, motor_2.config.channel);
+    HAL_TIM_OC_Start_IT(motor_3.config.htim, motor_3.config.channel);
+    HAL_TIM_OC_Start_IT(motor_4.config.htim, motor_4.config.channel);
+
+#if MOTOR_LIFT_ENABLED
     /* 电机 5: TIM2_CH2, PG12(DIR), PG11(EN) */
-    /* 注意：需在 CubeMX 中开启 TIM2 Channel 2 (Toggle 模式) */
     motor_5.config.htim = &htim2;
     motor_5.config.channel = TIM_CHANNEL_2;
     motor_5.config.dir.port = GPIOG;
@@ -70,13 +85,22 @@ void BSP_Motor_Init(void)
     motor_5.config.en.pin = GPIO_PIN_11;
     motor_5.config.reverse = 0;
 
-    /* 启动 TIM1 的四个通道 (使用中断模式以统计步数) */
-    HAL_TIM_OC_Start_IT(motor_1.config.htim, motor_1.config.channel);
-    HAL_TIM_OC_Start_IT(motor_2.config.htim, motor_2.config.channel);
-    HAL_TIM_OC_Start_IT(motor_3.config.htim, motor_3.config.channel);
-    HAL_TIM_OC_Start_IT(motor_4.config.htim, motor_4.config.channel);
     HAL_TIM_OC_Start_IT(motor_5.config.htim, motor_5.config.channel);
+    LOG_I("motor_5 (lift / TIM2_CH2) enabled.");
+#else
+    /* TIM2 未配置：保持 htim 为 NULL，SetSpeed/Stop 会因为空指针保护而静默忽略 */
+    motor_5.config.htim = RT_NULL;
+    motor_5.speed = 0;
+    motor_5.total_steps = 0;
+    LOG_W("motor_5 (lift) DISABLED: TIM2 not configured in CubeMX.");
+#endif
+
+    return RT_EOK;
 }
+
+/* 导出为设备级自动初始化：系统启动时（main 线程 rt_components_init 阶段）自动调用。
+ * 必须晚于 rt_hw_board_init() 里的 MX_TIM1_Init()，此处顺序天然满足。 */
+INIT_DEVICE_EXPORT(BSP_Motor_Init);
 
 /**
  * @brief  设置电机速度
@@ -85,6 +109,19 @@ void BSP_Motor_SetSpeed(Motor_t *motor, int32_t speed)
 {
     uint32_t arr_val = 0;
     uint8_t direction = 0;
+
+    if (motor == RT_NULL)
+    {
+        return;
+    }
+
+    /* 未配置定时器的电机（例如 TIM2 缺失时的 motor_5）：只记录目标速度，
+     * 不碰任何寄存器，避免 __HAL_TIM_SET_AUTORELOAD(NULL,...) 触发 HardFault */
+    if (motor->config.htim == RT_NULL)
+    {
+        motor->speed = speed;
+        return;
+    }
 
     /* 限制范围 */
     if (speed > 10000)
@@ -125,7 +162,19 @@ void BSP_Motor_SetSpeed(Motor_t *motor, int32_t speed)
  */
 void BSP_Motor_Stop(Motor_t *motor)
 {
+    if (motor == RT_NULL)
+    {
+        return;
+    }
+
     motor->speed = 0;
+
+    /* 未配置定时器的电机只需清速度，不能碰寄存器 */
+    if (motor->config.htim == RT_NULL)
+    {
+        return;
+    }
+
     /* 停止脉冲 (或者将 ARR 设为极大值) */
     __HAL_TIM_SET_AUTORELOAD(motor->config.htim, 65535);
 }
@@ -135,7 +184,7 @@ void BSP_Motor_Stop(Motor_t *motor)
  */
 void BSP_Motor_Enable(Motor_t *motor, uint8_t enable)
 {
-    if (motor->config.en.port != NULL)
+    if (motor != RT_NULL && motor->config.en.port != NULL)
     {
         HAL_GPIO_WritePin(motor->config.en.port, motor->config.en.pin,
                           enable ? GPIO_PIN_RESET : GPIO_PIN_SET);
@@ -169,6 +218,7 @@ void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef *htim)
                 p_motor->total_steps--;
         }
     }
+#if MOTOR_LIFT_ENABLED
     else if (htim->Instance == TIM2)
     {
         /* 第 5 个电机挂在 TIM2_CH2 上 */
@@ -183,6 +233,7 @@ void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef *htim)
             }
         }
     }
+#endif
 }
 
 /**

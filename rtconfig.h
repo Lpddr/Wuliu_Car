@@ -81,6 +81,7 @@
 /* Device Drivers */
 
 #define RT_USING_DEVICE_IPC
+#define RT_USING_WDT
 
 /* Using USB */
 

@@ -39,6 +39,7 @@ static rt_err_t wdt_control(rt_watchdog_t *wdt, int cmd, void *arg)
         if(HAL_IWDG_Refresh(&stm32_wdt.hiwdg) != HAL_OK)
         {
             LOG_E("watch dog keepalive fail.");
+            return -RT_ERROR;
         }
         break;
         /* set watchdog timeout */

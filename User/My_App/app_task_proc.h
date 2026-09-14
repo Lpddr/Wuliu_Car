@@ -65,6 +65,12 @@ typedef enum
  */
 int App_Task_Brain_Init(void);
 
+/**
+ * @brief 上报底盘控制线程仍在正常运行
+ * @note  这是供硬件看门狗监控线程检查的软件心跳，不直接操作 IWDG。
+ */
+void App_Watchdog_ReportMoveAlive(void);
+
 /*
  * 全局事件对象导出，供子模块 (动作、底盘、视觉) 发送信号使用
  */

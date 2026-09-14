@@ -22,6 +22,7 @@
 #include "stm32f4xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "bsp_uart.h"   /* 串口空闲中断回调 BSP_UART_IdleCallback() */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -65,6 +66,7 @@ extern DMA_HandleTypeDef hdma_usart3_tx;
 extern DMA_HandleTypeDef hdma_usart6_rx;
 extern DMA_HandleTypeDef hdma_usart6_tx;
 extern UART_HandleTypeDef huart1;
+extern UART_HandleTypeDef huart2;
 extern UART_HandleTypeDef huart3;
 extern UART_HandleTypeDef huart6;
 /* USER CODE BEGIN EV */
@@ -291,12 +293,33 @@ void TIM1_CC_IRQHandler(void)
 void USART1_IRQHandler(void)
 {
   /* USER CODE BEGIN USART1_IRQn 0 */
-
+  /* 先处理 DMA 空闲中断（一帧接收完成），再交给 HAL。
+     顺序不能颠倒：HAL_UART_IRQHandler() 一旦检测到 PE/FE/NE/ORE 会执行
+     __HAL_UART_CLEAR_PEFLAG()（读 SR 再读 DR），而"读 SR 再读 DR"这个序列
+     恰好也会清掉 IDLE 标志，会把本帧的完成事件吃掉。 */
+  BSP_UART_IdleCallback(&uart1_qr);
   /* USER CODE END USART1_IRQn 0 */
   HAL_UART_IRQHandler(&huart1);
   /* USER CODE BEGIN USART1_IRQn 1 */
 
   /* USER CODE END USART1_IRQn 1 */
+}
+
+/**
+ * @brief This function handles USART2 global interrupt.
+ * @note  原工程缺失这个函数，向量表里 USART2_IRQHandler 一直指向 weak
+ *        Default_Handler（死循环）。这里补上，并配合 BSP_UART_Init() 里
+ *        新增的 HAL_NVIC_EnableIRQ(USART2_IRQn) 一起才能真正生效。
+ */
+void USART2_IRQHandler(void)
+{
+  /* USER CODE BEGIN USART2_IRQn 0 */
+  BSP_UART_IdleCallback(&uart2_imu);
+  /* USER CODE END USART2_IRQn 0 */
+  HAL_UART_IRQHandler(&huart2);
+  /* USER CODE BEGIN USART2_IRQn 1 */
+
+  /* USER CODE END USART2_IRQn 1 */
 }
 
 /**
@@ -375,7 +398,8 @@ void DMA2_Stream7_IRQHandler(void)
 void USART6_IRQHandler(void)
 {
   /* USER CODE BEGIN USART6_IRQn 0 */
-
+  /* 同 USART1：空闲中断必须在 HAL_UART_IRQHandler() 之前处理 */
+  BSP_UART_IdleCallback(&uart6_vision);
   /* USER CODE END USART6_IRQn 0 */
   HAL_UART_IRQHandler(&huart6);
   /* USER CODE BEGIN USART6_IRQn 1 */

@@ -13,9 +13,11 @@
 
 /**
  * @usage 使用说明:
- * 1. 初始化: 调用 BSP_UART_Init(&uart2_imu)
+ * 1. 初始化: 调用 BSP_UART_InitAll() 一次性初始化 uart1_qr / uart2_imu / uart6_vision
+ *            （已通过 INIT_DEVICE_EXPORT 自动执行，通常无需手动调用）
  * 2. 发送:   调用 BSP_UART_Send(&uart2_imu, data, len)
- * 3. 接收:   数据自动进入 rx_buffer，通过 rx_flag 判断新数据
+ * 3. 接收:   数据自动进入 rx_buffer，通过 rx_len 获取长度；空闲中断会向对应消息队列投递
+ * 4. 中断:   需在 USARTx_IRQHandler 中调用 BSP_UART_IdleCallback(&uartx)
  */
 
 #define UART_RX_BUF_SIZE 128
@@ -36,8 +38,10 @@ extern UART_t uart2_imu;    /* 串口 2: IMU 陀螺仪 */
 extern UART_t uart6_vision; /* 串口 6: 物料识别摄像头 */
 
 /* 函数接口 */
-void BSP_UART_Init(UART_t *uart);
+int  BSP_UART_InitAll(void);                                            /* 一次性初始化全部 3 路串口 */
+void BSP_UART_Init(UART_t *uart);                                       /* 单路初始化 */
 void BSP_UART_Send(UART_t *uart, uint8_t *data, uint16_t len);
 void BSP_UART_printf(UART_t *uart, const char *format, ...);
+void BSP_UART_IdleCallback(UART_t *uart);                               /* 在 USARTx_IRQHandler 中调用 */
 
 #endif /* __BSP_UART_H */

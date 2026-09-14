@@ -36,6 +36,9 @@ typedef enum
  * @param  distance_mm: 计划运行的位移距离。单位：mm。
  *                     - 若传入 500.0f : 小车走 50cm 后利用 T 型曲线自动刹停。
  *                     - 若传入 0.0f   : 小车进入巡航模式，持续行驶。
+ * @note   线程安全：本函数会把 mode/speed/pulse/yaw 四个字段连同里程计复位
+ *         作为一次原子发布（内部互斥锁保护），供 move_proc 线程整组采样。
+ *         因此可以在任意线程上下文调用，不会让控制周期看到"半更新"的命令。
  */
 void Move_Now(Move_Mode_t mode, float speed_mm_s, float distance_mm);
 
@@ -45,12 +48,16 @@ void Move_Now(Move_Mode_t mode, float speed_mm_s, float distance_mm);
  *                   - 0.0 : 发车时的初始正方向
  *                   - 90.0: 向左转 90 度
  *                   - 270.0 (或 -90.0): 向右转 90 度
+ * @note   线程安全：命令字段整组原子发布（内部互斥锁保护）。
  */
 void Move_Turn_Abs(float abs_angle);
 
 /**
  * @brief  [API] 紧急主动停止
  * @note   强制清空所有运动状态，清空里程计目标，使底盘电机制动停止。
+ * @note   线程安全：本函数既会被 brain 线程调用（视觉超时保护），也会被
+ *         move_proc 线程自己调用（到位停车 / IMU 掉线停车），因此命令字段
+ *         的写入加了互斥锁；电机停机在锁外执行。
  */
 void Move_Stop(void);
 

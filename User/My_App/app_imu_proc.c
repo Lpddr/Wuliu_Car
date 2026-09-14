@@ -6,7 +6,7 @@
  ******************************************************************************
  */
 
-*/
+
 
 #include "app_imu_proc.h"
 #include "../Components/imu_wit.h"
@@ -38,13 +38,50 @@ static void imu_proc(void *parameter)
             /* 2. 在线程环境中执行复杂的包解析 */
             IMU_ParsePacket(uart2_imu.rx_buffer, (uint16_t)rx_len);
 
-            /* 3. 使用互斥锁保护共享数据更新 */
+            /* 3. 使用互斥锁保护共享数据更新
+             *    临界区只做「赋值 + 盖章」，尽量短。
+             *    move_proc(优先级 8) 高于本线程(10)，这里依赖互斥锁的
+             *    优先级继承特性来避免优先级反转。 */
             rt_mutex_take(imu_data_mutex, RT_WAITING_FOREVER);
+            imu_app_data.pitch = g_imu_data.pitch;
+            imu_app_data.roll = g_imu_data.roll;
             imu_app_data.yaw = g_imu_data.yaw;
             imu_app_data.yaw_total = g_imu_data.yaw_continuous;
+            imu_app_data.timestamp = rt_tick_get(); /* 盖章：本帧数据入应用的时刻 */
+            imu_app_data.seq++;                     /* 更新序号自增，供消费者判断新旧 */
             rt_mutex_release(imu_data_mutex);
         }
     }
+}
+
+/**
+ * @brief  [API] 原子地取出一份 IMU 一致快照
+ * @note   这是消费者侧的唯一推荐入口，替代直接访问 imu_app_data。
+ *         在临界区内做结构体整体拷贝，保证 4 个字段 + 时间戳同源；
+ *         取出后再判断新鲜度，避免"持锁做业务判断"。
+ */
+rt_err_t App_IMU_GetData(App_IMU_Data_t *out, rt_tick_t max_age)
+{
+    rt_tick_t stamp;
+
+    if (out == RT_NULL || imu_data_mutex == RT_NULL)
+    {
+        return -RT_ERROR;
+    }
+
+    /* 临界区：一次性整体拷贝，拿到自洽快照（不会出现新 yaw + 旧 yaw_total） */
+    rt_mutex_take(imu_data_mutex, RT_WAITING_FOREVER);
+    *out = imu_app_data;
+    rt_mutex_release(imu_data_mutex);
+
+    /* 无符号相减，天然正确处理 rt_tick 回绕 */
+    stamp = out->timestamp;
+    if (max_age != 0 && (rt_tick_get() - stamp) > max_age)
+    {
+        return -RT_ETIMEOUT; /* 数据过期：IMU 掉线或长时间无帧 */
+    }
+
+    return RT_EOK;
 }
 
 /**

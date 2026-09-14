@@ -19,6 +19,11 @@
 #include <rtdbg.h>
 #include <stdlib.h>
 
+#ifdef RT_USING_WDT
+#include <rtdevice.h>
+#include <drivers/watchdog.h>
+#endif
+
 /* 1. 声明 RTOS 资源 */
 struct rt_event mission_event;
 
@@ -29,23 +34,143 @@ static uint8_t g_batch2[3] = {0};
 /* 2. 当前状态全局追踪 */
 static Mission_State_t current_state = STATE_IDLE;
 
-/* [Safety] 视觉看门狗: 防止摄像头卡死导致 PID 暴走 */
-static void Check_Vision_Timeout(void)
-{
-    /* 如果超过 360ms 没有新数据 (正常是一帧) */
-    if ((rt_tick_get() - vision_app_data.last_update) > rt_tick_from_millisecond(360))
-    {
-        /* 只有当正在寻像时才打印警告，避免刷屏 */
-        if (vision_app_data.is_found == RT_TRUE)
-        {
-            LOG_E("[Safety] Vision Data Timeout! Stopping car...");
-        }
+#define HW_WATCHDOG_TIMEOUT_SECONDS 5U
+#define HW_WATCHDOG_FEED_PERIOD_MS 1000U
+#define MOVE_HEARTBEAT_TIMEOUT_MS 500U
+#define WATCHDOG_STARTUP_GRACE_MS 1000U
+#define WATCHDOG_THREAD_STACK_SIZE 1024
+#define WATCHDOG_THREAD_PRIORITY 30
+#define WATCHDOG_THREAD_TIMESLICE 10
 
-        Move_Stop();                         // 1. 立即停车
-        vision_app_data.is_found = RT_FALSE; // 2. 强制置为未找到 (中断 PID 循环)
+static volatile rt_tick_t move_last_alive_tick = 0;
+
+#define VISION_DATA_TIMEOUT_MS 360
+#define VISION_TIMEOUT_RECHECK_MS 20
+
+/* 同一次视觉掉线只执行一次停车和日志；收到新数据后自动解除锁定。 */
+static rt_bool_t vision_timeout_latched = RT_FALSE;
+
+/* [Safety] 视觉数据超时保护：防止旧坐标继续参与底盘控制。 */
+static rt_bool_t Check_Vision_Timeout(void)
+{
+    rt_tick_t now = rt_tick_get();
+    rt_tick_t last_update = vision_app_data.last_update;
+
+    /* 无符号 tick 相减可以正确处理计数器回绕。 */
+    if ((now - last_update) <= rt_tick_from_millisecond(VISION_DATA_TIMEOUT_MS))
+    {
+        vision_timeout_latched = RT_FALSE;
+        return RT_FALSE;
     }
+
+    /* 先使旧坐标失效，防止本轮控制继续使用过期数据。 */
+    vision_app_data.is_found = RT_FALSE;
+
+    if (vision_timeout_latched == RT_FALSE)
+    {
+        vision_timeout_latched = RT_TRUE;
+        LOG_E("[Safety] Vision data timeout (>%d ms), stopping car.",
+              VISION_DATA_TIMEOUT_MS);
+        Move_Stop();
+    }
+
+    return RT_TRUE;
 }
 
+
+/**
+ * @brief 底盘控制线程的软件心跳
+ * @note  这里只更新时间戳，真正的硬件喂狗只允许监控线程执行。
+ */
+void App_Watchdog_ReportMoveAlive(void)
+{
+    move_last_alive_tick = rt_tick_get();
+}
+
+#ifdef RT_USING_WDT
+/**
+ * @brief 硬件独立看门狗监控线程
+ *
+ * 线程优先级为 30，仅高于 idle(31)。如果高优先级线程持续占用 CPU，
+ * 本线程无法运行和喂狗，IWDG 最终会复位 MCU。
+ *
+ * 此外，本线程检查始终以 20 ms 周期运行的 move_proc 心跳；
+ * 心跳停止时先尝试停车，随后停止喂狗，交由 IWDG 完成系统复位。
+ */
+static void hardware_watchdog_thread_entry(void *parameter)
+{
+    rt_device_t wdt_device;
+    rt_uint32_t timeout_seconds = HW_WATCHDOG_TIMEOUT_SECONDS;
+    rt_bool_t move_fault_reported = RT_FALSE;
+
+    (void)parameter;
+
+    /* 给板级驱动和应用线程留出启动时间，再开启不可关闭的 IWDG。 */
+    rt_thread_mdelay(WATCHDOG_STARTUP_GRACE_MS);
+
+    wdt_device = rt_device_find("wdt");
+    if (wdt_device == RT_NULL)
+    {
+        LOG_E("IWDG device 'wdt' not found.");
+        return;
+    }
+
+    if (rt_device_init(wdt_device) != RT_EOK)
+    {
+        LOG_E("IWDG device init failed.");
+        return;
+    }
+
+    if (rt_device_control(wdt_device, RT_DEVICE_CTRL_WDT_SET_TIMEOUT,
+                          &timeout_seconds) != RT_EOK)
+    {
+        LOG_E("IWDG timeout configuration failed.");
+        return;
+    }
+
+    if (rt_device_control(wdt_device, RT_DEVICE_CTRL_WDT_START,
+                          RT_NULL) != RT_EOK)
+    {
+        LOG_E("IWDG start failed.");
+        return;
+    }
+
+    LOG_I("IWDG started: timeout=%u s, feed period=%u ms.",
+          timeout_seconds, HW_WATCHDOG_FEED_PERIOD_MS);
+
+    while (1)
+    {
+        rt_tick_t now;
+        rt_tick_t last_alive;
+
+        rt_thread_mdelay(HW_WATCHDOG_FEED_PERIOD_MS);
+        now = rt_tick_get();
+        last_alive = move_last_alive_tick;
+
+        if ((now - last_alive) <= rt_tick_from_millisecond(MOVE_HEARTBEAT_TIMEOUT_MS))
+        {
+            if (rt_device_control(wdt_device, RT_DEVICE_CTRL_WDT_KEEPALIVE,
+                                  RT_NULL) != RT_EOK)
+            {
+                LOG_E("IWDG feed failed; hardware reset may follow.");
+            }
+
+            if (move_fault_reported)
+            {
+                LOG_W("move_proc heartbeat recovered.");
+                move_fault_reported = RT_FALSE;
+            }
+        }
+        else if (move_fault_reported == RT_FALSE)
+        {
+            move_fault_reported = RT_TRUE;
+            LOG_E("move_proc heartbeat timeout; stop feeding IWDG.");
+            Move_Stop();
+            /* 不再喂狗；若底盘线程持续异常，IWDG 将在超时后复位 MCU。 */
+        }
+    }
+}
+#endif
 /**
  * @brief 大脑指揮中心线程入口
  */
@@ -126,7 +251,11 @@ static void brain_thread_entry(void *parameter)
                 while (1)
                 {
                     /* [Safety] 检查视觉心跳 */
-                    Check_Vision_Timeout();
+                    if (Check_Vision_Timeout())
+                    {
+                        rt_thread_mdelay(VISION_TIMEOUT_RECHECK_MS);
+                        continue;
+                    }
 
                     /* 只有当看到的 ID 匹配，且视野中确实有物料时才判定成功 */
                     if (vision_app_data.is_found && vision_app_data.target_id == target_id)
@@ -196,7 +325,11 @@ static void brain_thread_entry(void *parameter)
                 while (1)
                 {
                     /* [Safety] 检查视觉心跳 */
-                    Check_Vision_Timeout();
+                    if (Check_Vision_Timeout())
+                    {
+                        rt_thread_mdelay(VISION_TIMEOUT_RECHECK_MS);
+                        continue;
+                    }
 
                     uint8_t ring_id = g_batch1[i] + 3;
 
@@ -311,7 +444,11 @@ static void brain_thread_entry(void *parameter)
                 while (1)
                 {
                     /* [Safety] 检查视觉心跳 */
-                    Check_Vision_Timeout();
+                    if (Check_Vision_Timeout())
+                    {
+                        rt_thread_mdelay(VISION_TIMEOUT_RECHECK_MS);
+                        continue;
+                    }
 
                     uint8_t ring_id = g_batch1[i] + 3;
                     if (!vision_app_data.is_found || vision_app_data.target_id != ring_id)
@@ -379,7 +516,11 @@ static void brain_thread_entry(void *parameter)
                 while (1)
                 {
                     /* [Safety] 检查视觉心跳 */
-                    Check_Vision_Timeout();
+                    if (Check_Vision_Timeout())
+                    {
+                        rt_thread_mdelay(VISION_TIMEOUT_RECHECK_MS);
+                        continue;
+                    }
 
                     if (vision_app_data.is_found && vision_app_data.target_id == target_id)
                     {
@@ -447,7 +588,11 @@ static void brain_thread_entry(void *parameter)
                 while (1)
                 {
                     /* [Safety] 检查视觉心跳 */
-                    Check_Vision_Timeout();
+                    if (Check_Vision_Timeout())
+                    {
+                        rt_thread_mdelay(VISION_TIMEOUT_RECHECK_MS);
+                        continue;
+                    }
 
                     uint8_t ring_id = g_batch2[i] + 3;
                     if (!vision_app_data.is_found || vision_app_data.target_id != ring_id)
@@ -557,7 +702,11 @@ static void brain_thread_entry(void *parameter)
                 while (1)
                 {
                     /* [Safety] 检查视觉心跳 */
-                    Check_Vision_Timeout();
+                    if (Check_Vision_Timeout())
+                    {
+                        rt_thread_mdelay(VISION_TIMEOUT_RECHECK_MS);
+                        continue;
+                    }
 
                     // 瞄准点依然是当初放置第一批次时的色环 ID
                     uint8_t ring_id = g_batch1[i] + 3;
@@ -675,6 +824,22 @@ int App_Task_Brain_Init(void)
     {
         rt_thread_startup(ktid);
     }
+
+#ifdef RT_USING_WDT
+    /* 4. 创建最低优先级的硬件看门狗监控线程 */
+    rt_thread_t wdt_tid = rt_thread_create("wdt_mon",
+                                           hardware_watchdog_thread_entry,
+                                           RT_NULL,
+                                           WATCHDOG_THREAD_STACK_SIZE,
+                                           WATCHDOG_THREAD_PRIORITY,
+                                           WATCHDOG_THREAD_TIMESLICE);
+    if (wdt_tid == RT_NULL)
+    {
+        LOG_E("hardware watchdog monitor thread create failed.");
+        return -RT_ERROR;
+    }
+    rt_thread_startup(wdt_tid);
+#endif
 
     return RT_EOK;
 }
