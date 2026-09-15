@@ -22,6 +22,7 @@
 #define EV_QR_FINISHED (1 << 1)   /* 二维码解析完成 (码单到手) */
 #define EV_MOVE_FINISHED (1 << 2) /* 底盘移动并停稳 (坐标到达) */
 #define EV_ARM_FINISHED (1 << 3)  /* 机械臂动作组执行完毕 */
+#define EV_ARM_ERROR (1 << 4)     /* 机械臂动作执行失败或超时 */
 #define EV_ALL_ERROR (1 << 7)     /* 系统紧急错误信号 */
 
 /*
@@ -57,7 +58,8 @@ typedef enum
     STATE_PICK_CAR_FLOOREND_2, /* 15. [动作] 车上 -> 暂存区码垛 (Stacking) */
 
     STATE_GO_HOME, /* 16. 完赛回家 */
-    STATE_DONE     /* 17. 结束 */
+    STATE_DONE,    /* 17. 结束 */
+    STATE_ERROR    /* 18. 故障保护 */
 } Mission_State_t;
 
 /**

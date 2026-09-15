@@ -12,7 +12,6 @@
 #include "app_qr_proc.h"
 #include "app_vision_proc.h"
 #include "../My_Driver/bsp_key_led.h"
-#include "../My_Driver/bsp_servo.h"
 
 #define DBG_TAG "app.brain"
 #define DBG_LVL DBG_LOG
@@ -77,6 +76,51 @@ static rt_bool_t Check_Vision_Timeout(void)
     return RT_TRUE;
 }
 
+#define ARM_WAIT_TIMEOUT_MS (ARM_ACTION_TIMEOUT_MS + 1000U)
+
+/**
+ * @brief 等待机械臂独立线程完成当前动作
+ * @param send_result: 机械臂命令投递结果
+ */
+static rt_bool_t Wait_Arm_Action(rt_err_t send_result)
+{
+    rt_uint32_t recved_ev = 0;
+    rt_err_t result;
+
+    if (send_result != RT_EOK)
+    {
+        LOG_E("arm command send failed.");
+    }
+    else
+    {
+        result = rt_event_recv(&mission_event,
+                               EV_ARM_FINISHED | EV_ARM_ERROR,
+                               RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR,
+                               rt_tick_from_millisecond(ARM_WAIT_TIMEOUT_MS),
+                               &recved_ev);
+
+        if (result == RT_EOK && (recved_ev & EV_ARM_FINISHED) != 0)
+        {
+            return RT_TRUE;
+        }
+
+        if (result == -RT_ETIMEOUT)
+        {
+            LOG_E("wait arm action timeout (>%u ms).",
+                  ARM_WAIT_TIMEOUT_MS);
+        }
+        else
+        {
+            LOG_E("arm action failed, event=0x%08x.", recved_ev);
+        }
+    }
+
+    Move_Stop();
+    App_Arm_EmergencyStop();
+    current_state = STATE_ERROR;
+    return RT_FALSE;
+}
+
 
 /**
  * @brief 底盘控制线程的软件心跳
@@ -94,14 +138,14 @@ void App_Watchdog_ReportMoveAlive(void)
  * 线程优先级为 30，仅高于 idle(31)。如果高优先级线程持续占用 CPU，
  * 本线程无法运行和喂狗，IWDG 最终会复位 MCU。
  *
- * 此外，本线程检查始终以 20 ms 周期运行的 move_proc 心跳；
- * 心跳停止时先尝试停车，随后停止喂狗，交由 IWDG 完成系统复位。
+ * 此外，本线程同时检查 move_proc 心跳和机械臂动作超时；
+ * 任一关键条件异常时先尝试停车，随后停止喂狗，由 IWDG 完成复位。
  */
 static void hardware_watchdog_thread_entry(void *parameter)
 {
     rt_device_t wdt_device;
     rt_uint32_t timeout_seconds = HW_WATCHDOG_TIMEOUT_SECONDS;
-    rt_bool_t move_fault_reported = RT_FALSE;
+    rt_bool_t fault_reported = RT_FALSE;
 
     (void)parameter;
 
@@ -142,12 +186,15 @@ static void hardware_watchdog_thread_entry(void *parameter)
     {
         rt_tick_t now;
         rt_tick_t last_alive;
+        rt_bool_t arm_healthy;
 
         rt_thread_mdelay(HW_WATCHDOG_FEED_PERIOD_MS);
         now = rt_tick_get();
         last_alive = move_last_alive_tick;
+        arm_healthy = App_Arm_IsHealthy();
 
-        if ((now - last_alive) <= rt_tick_from_millisecond(MOVE_HEARTBEAT_TIMEOUT_MS))
+        if ((now - last_alive) <= rt_tick_from_millisecond(MOVE_HEARTBEAT_TIMEOUT_MS) &&
+            arm_healthy == RT_TRUE)
         {
             if (rt_device_control(wdt_device, RT_DEVICE_CTRL_WDT_KEEPALIVE,
                                   RT_NULL) != RT_EOK)
@@ -155,18 +202,28 @@ static void hardware_watchdog_thread_entry(void *parameter)
                 LOG_E("IWDG feed failed; hardware reset may follow.");
             }
 
-            if (move_fault_reported)
+            if (fault_reported)
             {
-                LOG_W("move_proc heartbeat recovered.");
-                move_fault_reported = RT_FALSE;
+                LOG_W("watchdog monitored tasks recovered.");
+                fault_reported = RT_FALSE;
             }
         }
-        else if (move_fault_reported == RT_FALSE)
+        else if (fault_reported == RT_FALSE)
         {
-            move_fault_reported = RT_TRUE;
-            LOG_E("move_proc heartbeat timeout; stop feeding IWDG.");
+            fault_reported = RT_TRUE;
+
+            if (arm_healthy == RT_FALSE)
+            {
+                LOG_E("arm task fault; stop feeding IWDG.");
+                App_Arm_EmergencyStop();
+            }
+            else
+            {
+                LOG_E("move_proc heartbeat timeout; stop feeding IWDG.");
+            }
+
             Move_Stop();
-            /* 不再喂狗；若底盘线程持续异常，IWDG 将在超时后复位 MCU。 */
+            /* 不再喂狗；关键任务持续异常时，IWDG 将在超时后复位 MCU。 */
         }
     }
 }
@@ -198,11 +255,11 @@ static void brain_thread_entry(void *parameter)
         case STATE_SCAN_QR:
             /* 第一步：扫码位移准备 (左移 132mm) */
             Move_Now(MOVE_SLIDE_LEFT, 100.0f, 132.0f);
-            rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+            rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
 
             /* 前进 686mm */
             Move_Now(MOVE_FORWARD, 300.0f, 686.0f);
-            rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+            rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
 
             /* 第二步：阻塞等待 MQ 数据 */
             QR_Task_Msg_t task_msg;
@@ -226,8 +283,8 @@ static void brain_thread_entry(void *parameter)
             /* 第三步：前往原料区 (第1次) - 前进 699mm */
             Move_Now(MOVE_FORWARD, 300.0f, 699.0f);
             /* 等待底盘停稳信号 (来自 app_move_proc.c) */
-            if (rt_event_recv(&mission_event, EV_MOVE_FINISHED,
-                              RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR,
+            if (rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR,
+                              RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR,
                               RT_WAITING_FOREVER, &recved_ev) == RT_EOK)
             {
                 LOG_I("Reached Plate Area 1.");
@@ -240,8 +297,10 @@ static void brain_thread_entry(void *parameter)
             for (int i = 0; i < 3; i++)
             {
                 /* 1. 机械臂复位 */
-                Servo_SetAngle(SERVO_BASE, 0);
-                Servo_SetAngle(SERVO_ARM, CLAW_OPEN); //
+                if (Wait_Arm_Action(Arm_Prepare()) == RT_FALSE)
+                {
+                    break;
+                }
                 rt_thread_mdelay(1000);               // 给机械臂和视觉留出稳定时间
 
                 /* 2. 目标匹配 */
@@ -267,8 +326,16 @@ static void brain_thread_entry(void *parameter)
                 }
 
                 /* 3. 执行物理动作：抓取并存入车内对应格位 */
-                Arm_Pick_From_Raw();
-                Arm_Place_To_Car(i + 1);
+                if (Wait_Arm_Action(Arm_Pick_From_Raw()) == RT_FALSE ||
+                    Wait_Arm_Action(Arm_Place_To_Car(i + 1)) == RT_FALSE)
+                {
+                    break;
+                }
+            }
+
+            if (current_state == STATE_ERROR)
+            {
+                break;
             }
 
             // LOG_I("First Batch Successfully Loaded.");
@@ -280,19 +347,19 @@ static void brain_thread_entry(void *parameter)
 
             /* 1. 后退 323mm */
             Move_Now(MOVE_BACKWARD, 350.0f, 323.0f);
-            rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+            rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
 
             /* 2. 右转 90° (绝对角度 270°) */
             Move_Turn_Abs(270.0f);
-            rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+            rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
 
             /* 3. 后退 1672mm */
             Move_Now(MOVE_BACKWARD, 550.0f, 1672.0f);
-            rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+            rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
 
             /* 4. 再次右转 90° (绝对角度 180°) */
             Move_Turn_Abs(180.0f);
-            rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+            rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
 
             LOG_I("Reached Floor Area.");
             current_state = STATE_PICK_CAR_FLOOR_1;
@@ -307,18 +374,20 @@ static void brain_thread_entry(void *parameter)
                 {
                     /* 前进 150mm */
                     Move_Now(MOVE_FORWARD, 100.0f, 150.0f);
-                    rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+                    rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
                 }
                 else if (i == 2)
                 {
                     /* 后退 300mm */
                     Move_Now(MOVE_BACKWARD, 200.0f, 300.0f);
-                    rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+                    rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
                 }
 
                 /* 2. 战备：机械臂回正，开爪，确保视野清爽 */
-                Servo_SetAngle(SERVO_BASE, 0);
-                Servo_SetAngle(SERVO_ARM, CLAW_OPEN);
+                if (Wait_Arm_Action(Arm_Prepare()) == RT_FALSE)
+                {
+                    break;
+                }
                 rt_thread_mdelay(1500);
 
                 /* 3. 视觉纠偏  */
@@ -348,13 +417,13 @@ static void brain_thread_entry(void *parameter)
                     {
                         // X > 160 代表目标在视野右侧 (对应车体偏向货格前方)，需后退校准
                         Move_Now((x > 160) ? MOVE_BACKWARD : MOVE_FORWARD, 20.0f, 10.0f);
-                        rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+                        rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
                     }
                     else if (abs(y - 140) > 10)
                     {
                         // Y > 140 代表目标在视野下方 (对应离货格太远)，需侧移靠近
                         Move_Now((y > 140) ? MOVE_SLIDE_RIGHT : MOVE_SLIDE_LEFT, 20.0f, 10.0f);
-                        rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+                        rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
                     }
                     else
                         break; // 瞄准成功
@@ -362,8 +431,16 @@ static void brain_thread_entry(void *parameter)
                 }
 
                 /* 4. 执行取放动作 */
-                Arm_Pick_From_Car(i + 1);
-                Arm_Place_To_Floor();
+                if (Wait_Arm_Action(Arm_Pick_From_Car(i + 1)) == RT_FALSE ||
+                    Wait_Arm_Action(Arm_Place_To_Floor()) == RT_FALSE)
+                {
+                    break;
+                }
+            }
+
+            if (current_state == STATE_ERROR)
+            {
+                break;
             }
             LOG_I("Unloading to Floor 1 completed.");
             current_state = STATE_PICK_FLOOR_CAR_1;
@@ -373,7 +450,7 @@ static void brain_thread_entry(void *parameter)
             // LOG_I("[State] Picking from Floor back to Car 1...");
             /* 1. 先前进回到中心位 (前进 150mm) */
             Move_Now(MOVE_FORWARD, 50.0f, 150.0f);
-            rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+            rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
 
             for (int i = 0; i < 3; i++)
             {
@@ -381,22 +458,32 @@ static void brain_thread_entry(void *parameter)
                 if (i == 1) // 移向 Position 1 (前进 150mm)
                 {
                     Move_Now(MOVE_FORWARD, 400.0f, 150.0f);
-                    rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+                    rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
                 }
                 else if (i == 2) // 移向 Position 2 (后退 300mm)
                 {
                     Move_Now(MOVE_BACKWARD, 500.0f, 300.0f);
-                    rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+                    rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
                 }
 
                 /* 3. 战备：机械臂回正，开爪 */
-                Servo_SetAngle(SERVO_BASE, 0);
-                Servo_SetAngle(SERVO_ARM, CLAW_OPEN);
+                if (Wait_Arm_Action(Arm_Prepare()) == RT_FALSE)
+                {
+                    break;
+                }
                 rt_thread_mdelay(800);
 
                 /* 4. 直接执行抓取并放回车内 */
-                Arm_Pick_From_Floor();
-                Arm_Place_To_Car(i + 1);
+                if (Wait_Arm_Action(Arm_Pick_From_Floor()) == RT_FALSE ||
+                    Wait_Arm_Action(Arm_Place_To_Car(i + 1)) == RT_FALSE)
+                {
+                    break;
+                }
+            }
+
+            if (current_state == STATE_ERROR)
+            {
+                break;
             }
             LOG_I("Reloading to Car 1 completed.");
             current_state = STATE_GO_FLOOR_END_1;
@@ -406,15 +493,15 @@ static void brain_thread_entry(void *parameter)
             LOG_I("[State] Moving to FloorEnd 1...");
             /* 1. 后退 876mm */
             Move_Now(MOVE_BACKWARD, 360.0f, 876.0f);
-            rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+            rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
 
             /* 2. 转向 90度 */
             Move_Turn_Abs(90.0f);
-            rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+            rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
 
             /* 3. 后退 864mm */
             Move_Now(MOVE_BACKWARD, 360.0f, 864.0f);
-            rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+            rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
 
             current_state = STATE_PICK_CAR_FLOOREND_1;
             break;
@@ -427,17 +514,19 @@ static void brain_thread_entry(void *parameter)
                 if (i == 1) // 移向前方
                 {
                     Move_Now(MOVE_FORWARD, 200.0f, 150.0f);
-                    rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+                    rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
                 }
                 else if (i == 2) // 移向后方
                 {
                     Move_Now(MOVE_BACKWARD, 250.0f, 300.0f);
-                    rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+                    rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
                 }
 
                 /* 2. 战备：机械臂回正，开爪 */
-                Servo_SetAngle(SERVO_BASE, 0);
-                Servo_SetAngle(SERVO_ARM, CLAW_OPEN);
+                if (Wait_Arm_Action(Arm_Prepare()) == RT_FALSE)
+                {
+                    break;
+                }
                 rt_thread_mdelay(1500);
 
                 /* 3. 视觉纠偏 (适配 90° 旋转后的 XY 映射) */
@@ -463,12 +552,12 @@ static void brain_thread_entry(void *parameter)
                     if (abs(x - 160) > 10)
                     {
                         Move_Now((x > 160) ? MOVE_BACKWARD : MOVE_FORWARD, 50.0f, 15.0f);
-                        rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+                        rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
                     }
                     else if (abs(y - 140) > 10)
                     {
                         Move_Now((y > 140) ? MOVE_SLIDE_RIGHT : MOVE_SLIDE_LEFT, 50.0f, 15.0f);
-                        rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+                        rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
                     }
                     else
                         break;
@@ -476,8 +565,16 @@ static void brain_thread_entry(void *parameter)
                 }
 
                 /* 4. 执行放置动作 */
-                Arm_Pick_From_Car(i + 1);
-                Arm_Place_To_Floor();
+                if (Wait_Arm_Action(Arm_Pick_From_Car(i + 1)) == RT_FALSE ||
+                    Wait_Arm_Action(Arm_Place_To_Floor()) == RT_FALSE)
+                {
+                    break;
+                }
+            }
+
+            if (current_state == STATE_ERROR)
+            {
+                break;
             }
             LOG_I("Unloading to FloorEnd 1 completed.");
             current_state = STATE_GO_PLATE_2;
@@ -487,15 +584,15 @@ static void brain_thread_entry(void *parameter)
             LOG_I("[State] Returning to Plate 2...");
             /* 1. 后退 565mm */
             Move_Now(MOVE_BACKWARD, 466.0f, 565.0f);
-            rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+            rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
 
             /* 2. 转向到 0° (基准方向) */
             Move_Turn_Abs(0.0f);
-            rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+            rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
 
             /* 3. 再后退 369mm */
             Move_Now(MOVE_BACKWARD, 350.0f, 369.0f);
-            rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+            rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
 
             current_state = STATE_PICK_PLATE_2;
             break;
@@ -505,8 +602,10 @@ static void brain_thread_entry(void *parameter)
             for (int i = 0; i < 3; i++)
             {
                 /* 1. 战备整备：底座转正 0 度，爪子张开 */
-                Servo_SetAngle(SERVO_BASE, 0);
-                Servo_SetAngle(SERVO_ARM, CLAW_OPEN);
+                if (Wait_Arm_Action(Arm_Prepare()) == RT_FALSE)
+                {
+                    break;
+                }
                 rt_thread_mdelay(1000); // 给机械臂和视觉留出稳定时间
 
                 /* 2. 身份校验：锁定本轮任务色 (g_batch2[i]) */
@@ -530,8 +629,16 @@ static void brain_thread_entry(void *parameter)
                 }
 
                 /* 3. 执行物理动作：抓取并存入车内对应格位 */
-                Arm_Pick_From_Raw();
-                Arm_Place_To_Car(i + 1);
+                if (Wait_Arm_Action(Arm_Pick_From_Raw()) == RT_FALSE ||
+                    Wait_Arm_Action(Arm_Place_To_Car(i + 1)) == RT_FALSE)
+                {
+                    break;
+                }
+            }
+
+            if (current_state == STATE_ERROR)
+            {
+                break;
             }
 
             LOG_I("Second Batch Successfully Loaded.");
@@ -543,19 +650,19 @@ static void brain_thread_entry(void *parameter)
 
             /* 1. 后退 323mm */
             Move_Now(MOVE_BACKWARD, 350.0f, 323.0f);
-            rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+            rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
 
             /* 2. 右转 90° (绝对角度 270°) */
             Move_Turn_Abs(270.0f);
-            rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+            rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
 
             /* 3. 后退 1665mm */
             Move_Now(MOVE_BACKWARD, 600.0f, 1665.0f);
-            rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+            rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
 
             /* 4. 再次右转 90° (绝对角度 180°) */
             Move_Turn_Abs(180.0f);
-            rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+            rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
 
             LOG_I("Reached Floor Area for Batch 2.");
             current_state = STATE_PICK_CAR_FLOOR_2;
@@ -570,18 +677,20 @@ static void brain_thread_entry(void *parameter)
                 {
                     /* 前进 150mm */
                     Move_Now(MOVE_FORWARD, 100.0f, 150.0f);
-                    rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+                    rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
                 }
                 else if (i == 2)
                 {
                     /* 后退 300mm */
                     Move_Now(MOVE_BACKWARD, 100.0f, 300.0f);
-                    rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+                    rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
                 }
 
                 /* 2. 战备：机械臂回正，开爪 */
-                Servo_SetAngle(SERVO_BASE, 0);
-                Servo_SetAngle(SERVO_ARM, CLAW_OPEN);
+                if (Wait_Arm_Action(Arm_Prepare()) == RT_FALSE)
+                {
+                    break;
+                }
                 rt_thread_mdelay(1500);
 
                 /* 3. 视觉纠偏 (适配 90° 旋转后的 XY 映射) */
@@ -607,12 +716,12 @@ static void brain_thread_entry(void *parameter)
                     if (abs(x - 160) > 10)
                     {
                         Move_Now((x > 160) ? MOVE_BACKWARD : MOVE_FORWARD, 50.0f, 15.0f);
-                        rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+                        rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
                     }
                     else if (abs(y - 140) > 10)
                     {
                         Move_Now((y > 140) ? MOVE_SLIDE_RIGHT : MOVE_SLIDE_LEFT, 50.0f, 15.0f);
-                        rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+                        rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
                     }
                     else
                         break;
@@ -620,8 +729,16 @@ static void brain_thread_entry(void *parameter)
                 }
 
                 /* 4. 执行取放动作 */
-                Arm_Pick_From_Car(i + 1);
-                Arm_Place_To_Floor();
+                if (Wait_Arm_Action(Arm_Pick_From_Car(i + 1)) == RT_FALSE ||
+                    Wait_Arm_Action(Arm_Place_To_Floor()) == RT_FALSE)
+                {
+                    break;
+                }
+            }
+
+            if (current_state == STATE_ERROR)
+            {
+                break;
             }
             LOG_I("Unloading to Floor 2 completed.");
             current_state = STATE_PICK_FLOOR_CAR_2;
@@ -631,7 +748,7 @@ static void brain_thread_entry(void *parameter)
             // LOG_I("[State] Picking from Floor back to Car 2...");
             /* 1. 先前进回到中心位 (前进 150mm) */
             Move_Now(MOVE_FORWARD, 50.0f, 150.0f);
-            rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+            rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
 
             for (int i = 0; i < 3; i++)
             {
@@ -639,22 +756,32 @@ static void brain_thread_entry(void *parameter)
                 if (i == 1) // 移向前方
                 {
                     Move_Now(MOVE_FORWARD, 200.0f, 150.0f);
-                    rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+                    rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
                 }
                 else if (i == 2) // 移向后方
                 {
                     Move_Now(MOVE_BACKWARD, 250.0f, 300.0f);
-                    rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+                    rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
                 }
 
                 /* 3. 战备：机械臂回正，开爪 */
-                Servo_SetAngle(SERVO_BASE, 0);
-                Servo_SetAngle(SERVO_ARM, CLAW_OPEN);
+                if (Wait_Arm_Action(Arm_Prepare()) == RT_FALSE)
+                {
+                    break;
+                }
                 rt_thread_mdelay(800);
 
                 /* 4. 直接执行抓取并放回车内 */
-                Arm_Pick_From_Floor();
-                Arm_Place_To_Car(i + 1);
+                if (Wait_Arm_Action(Arm_Pick_From_Floor()) == RT_FALSE ||
+                    Wait_Arm_Action(Arm_Place_To_Car(i + 1)) == RT_FALSE)
+                {
+                    break;
+                }
+            }
+
+            if (current_state == STATE_ERROR)
+            {
+                break;
             }
             LOG_I("Reloading to Car 2 completed.");
             current_state = STATE_GO_FLOOR_END_2;
@@ -664,15 +791,15 @@ static void brain_thread_entry(void *parameter)
             LOG_I("[State] Moving to FloorEnd 2...");
             /* 1. 后退 874mm */
             Move_Now(MOVE_BACKWARD, 450.0f, 874.0f);
-            rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+            rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
 
             /* 2. 转向 90度 */
             Move_Turn_Abs(90.0f);
-            rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+            rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
 
             /* 3. 后退 864mm */
             Move_Now(MOVE_BACKWARD, 450.0f, 864.0f);
-            rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+            rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
 
             current_state = STATE_PICK_CAR_FLOOREND_2;
             break;
@@ -685,17 +812,19 @@ static void brain_thread_entry(void *parameter)
                 if (i == 1) // 移向前方 (前进 150mm)
                 {
                     Move_Now(MOVE_FORWARD, 150.0f, 150.0f);
-                    rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+                    rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
                 }
                 else if (i == 2) // 移向后方 (后退 300mm)
                 {
                     Move_Now(MOVE_BACKWARD, 250.0f, 300.0f);
-                    rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+                    rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
                 }
 
                 /* 2. 战备：机械臂回正，开爪 */
-                Servo_SetAngle(SERVO_BASE, 0);
-                Servo_SetAngle(SERVO_ARM, CLAW_OPEN);
+                if (Wait_Arm_Action(Arm_Prepare()) == RT_FALSE)
+                {
+                    break;
+                }
                 rt_thread_mdelay(1500);
 
                 /* 3. 视觉纠偏 (瞄准第一层已放好的货/色环) */
@@ -723,12 +852,12 @@ static void brain_thread_entry(void *parameter)
                     if (abs(x - 160) > 10)
                     {
                         Move_Now((x > 160) ? MOVE_BACKWARD : MOVE_FORWARD, 50.0f, 15.0f);
-                        rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+                        rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
                     }
                     else if (abs(y - 140) > 10)
                     {
                         Move_Now((y > 140) ? MOVE_SLIDE_RIGHT : MOVE_SLIDE_LEFT, 50.0f, 15.0f);
-                        rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+                        rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
                     }
                     else
                         break;
@@ -736,8 +865,16 @@ static void brain_thread_entry(void *parameter)
                 }
 
                 /* 4. 执行放置动作 (码垛放置至二层) */
-                Arm_Pick_From_Car(i + 1);
-                Arm_Place_To_Stack();
+                if (Wait_Arm_Action(Arm_Pick_From_Car(i + 1)) == RT_FALSE ||
+                    Wait_Arm_Action(Arm_Place_To_Stack()) == RT_FALSE)
+                {
+                    break;
+                }
+            }
+
+            if (current_state == STATE_ERROR)
+            {
+                break;
             }
             LOG_I("Final Stacking completed.");
             current_state = STATE_GO_HOME;
@@ -747,24 +884,27 @@ static void brain_thread_entry(void *parameter)
             LOG_I("[State] Returning Home...");
 
             /* 1. 机械臂收回，归位到车体中心 */
-            Servo_SetAngle(SERVO_BASE, 98);
+            if (Wait_Arm_Action(Arm_Return_Center()) == RT_FALSE)
+            {
+                break;
+            }
             rt_thread_mdelay(500);
 
             /* 2. 第一阶段后退：离开暂存区 1090mm */
             Move_Now(MOVE_BACKWARD, 450.0f, 1090.0f);
-            rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+            rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
 
             /* 3. 转向到 0° (基准起始方向) */
             Move_Turn_Abs(0.0f);
-            rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+            rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
 
             /* 4. 第二阶段长距离后退：返回起始区 (后退 2162mm) */
             Move_Now(MOVE_BACKWARD, 700.0f, 2162.0f);
-            rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+            rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
 
             /* 5. 最终平移：侧移 120mm 对齐起始点 */
             Move_Now(MOVE_SLIDE_RIGHT, 300.0f, 120.0f);
-            rt_event_recv(&mission_event, EV_MOVE_FINISHED, RT_EVENT_FLAG_AND | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
+            rt_event_recv(&mission_event, EV_MOVE_FINISHED | EV_ALL_ERROR, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved_ev);
 
             current_state = STATE_DONE;
             break;
@@ -774,6 +914,10 @@ static void brain_thread_entry(void *parameter)
             current_state = STATE_IDLE;
             break;
 
+        case STATE_ERROR:
+            /* 等待硬件看门狗复位，避免故障后继续执行任务流程。 */
+            rt_thread_mdelay(100);
+            break;
         default:
             break;
         }
